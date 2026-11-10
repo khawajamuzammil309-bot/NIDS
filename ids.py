@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CodeAlpha Cyber Security Internship - Task 4: Network Intrusion Detection System (NIDS)
+Network Intrusion Detection System (NIDS)
 A feature-rich NIDS using Python and Scapy to detect port scans, floods, brute-force attempts,
 and malicious payload signatures, complete with real-time alerts, automated IP blocking, and CSV/log exports.
 """
@@ -20,25 +20,42 @@ from scapy.all import sniff, IP, TCP, UDP, ICMP, Raw
 total_packets = 0
 alert_counter = Counter()
 blocked_ips = set()
+alert_cooldown = defaultdict(float)  # Tracks (src_ip, attack_type) -> last_alert_time
+
 packet_timestamps = defaultdict(deque)  # Tracks IP packet rates for floods
-port_scan_tracker = defaultdict(lambda: deque())  # Tracks (timestamp, dport) for port scanning
+port_scan_tracker = defaultdict(deque)  # Tracks (timestamp, dport) for port scanning
 brute_force_tracker = defaultdict(deque)  # Tracks authentication port connections
 
-# Signature patterns for web attack / injection payloads
+# Signature patterns for web attack / injection payloads (compiled as BYTES for speed)
 SUSPICIOUS_PATTERNS = [
-    (re.compile(r"(?i)(union\s+select|select\s+.*\s+from|or\s+1=1|drop\s+table)", re.IGNORECASE), "SQL Injection Attempt"),
-    (re.compile(r"(?i)(<script>|javascript:|alert\()", re.IGNORECASE), "Cross-Site Scripting (XSS)"),
-    (re.compile(r"(?i)(/etc/passwd|/etc/shadow|cmd\.exe|powershell)", re.IGNORECASE), "Directory Traversal / Command Injection"),
-    (re.compile(r"(?i)(admin|login|passwd|password)\b", re.IGNORECASE), "Sensitive Keyword Exposure"),
+    (re.compile(rb"(?i)(union\s+select|select\s+.*\s+from|or\s+1=1|drop\s+table)"), "SQL Injection Attempt"),
+    (re.compile(rb"(?i)(<script>|javascript:|alert\()"), "Cross-Site Scripting (XSS)"),
+    (re.compile(rb"(?i)(/etc/passwd|/etc/shadow|cmd\.exe|powershell)"), "Directory Traversal / Command Injection"),
+    (re.compile(rb"(?i)(admin|login|passwd|password)\b"), "Sensitive Keyword Exposure"),
 ]
 
 # Sensitive authentication ports (SSH, FTP, Telnet, RDP, Web Login)
 AUTH_PORTS = {21, 22, 23, 3389, 80, 443, 8080}
+COOLDOWN_PERIOD = 10  # Seconds to wait before repeating the same alert for the same IP
+
+
+def is_rate_limited(attacker_ip, attack_type):
+    """Prevents alert spamming by checking cooldown timers."""
+    key = (attacker_ip, attack_type)
+    now = time.time()
+    if now - alert_cooldown[key] < COOLDOWN_PERIOD:
+        return True
+    alert_cooldown[key] = now
+    return False
 
 
 def trigger_alert(attacker_ip, target_ip, attack_type, severity, details, config):
     """Logs alerts, triggers IP blocking, and saves statistics."""
     global blocked_ips
+
+    if is_rate_limited(attacker_ip, attack_type):
+        return
+
     alert_counter[attack_type] += 1
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -118,14 +135,15 @@ def analyze_packet(packet, config):
                 f"Rate exceeded: {len(packet_timestamps[key])} ICMP packets in 2s (Threshold: {icmp_threshold})",
                 config
             )
-            packet_timestamps[key].clear()
 
     # -------------------------------------------------------------
-    # Rule 2: TCP SYN Flood / DoS Detection
+    # Rule 2: TCP SYN Flood / DoS & Port Scanning
     # -------------------------------------------------------------
     if TCP in packet:
-        # Check SYN flag (SYN=2) without ACK flag
-        if packet[TCP].flags == "S":
+        tcp_flags = packet[TCP].flags
+
+        # Check SYN flag presence (supports SYN, SYN+ECE, etc.)
+        if "S" in tcp_flags and "A" not in tcp_flags:
             key = f"syn_{src_ip}"
             packet_timestamps[key].append(current_time)
             cleanup_tracker(packet_timestamps[key], current_time, window_seconds=3)
@@ -137,7 +155,6 @@ def analyze_packet(packet, config):
                     f"Rate exceeded: {len(packet_timestamps[key])} SYN requests in 3s (Threshold: {syn_threshold})",
                     config
                 )
-                packet_timestamps[key].clear()
 
         # -------------------------------------------------------------
         # Rule 3: Port Scanning Detection
@@ -158,12 +175,11 @@ def analyze_packet(packet, config):
                 f"Accessed {len(unique_ports)} unique ports within 5s (Threshold: {port_threshold})",
                 config
             )
-            ps_tracker.clear()
 
         # -------------------------------------------------------------
         # Rule 4: Brute Force Attempt Detection
         # -------------------------------------------------------------
-        if dport in AUTH_PORTS and packet[TCP].flags == "S":
+        if dport in AUTH_PORTS and "S" in tcp_flags:
             bf_key = f"bf_{src_ip}"
             brute_force_tracker[bf_key].append(current_time)
             cleanup_tracker(brute_force_tracker[bf_key], current_time, window_seconds=10)
@@ -175,26 +191,21 @@ def analyze_packet(packet, config):
                     f"{len(brute_force_tracker[bf_key])} attempts on auth port {dport} in 10s (Threshold: {bf_threshold})",
                     config
                 )
-                brute_force_tracker[bf_key].clear()
 
     # -------------------------------------------------------------
     # Rule 5: Malicious Payload Signature Inspection
     # -------------------------------------------------------------
     if Raw in packet:
-        try:
-            payload = packet[Raw].load.decode("utf-8", errors="ignore")
-            for pattern, attack_name in SUSPICIOUS_PATTERNS:
-                if pattern.search(payload):
-                    # Clean payload snippet for safe display
-                    clean_snippet = payload.strip().replace("\n", " ").replace("\r", "")[:50]
-                    trigger_alert(
-                        src_ip, dst_ip, attack_name, "CRITICAL",
-                        f"Signature match found in payload: '{clean_snippet}...'",
-                        config
-                    )
-                    break
-        except Exception:
-            pass
+        raw_payload = packet[Raw].load
+        for pattern, attack_name in SUSPICIOUS_PATTERNS:
+            if pattern.search(raw_payload):
+                clean_snippet = raw_payload[:50].decode("utf-8", errors="ignore").strip().replace("\n", " ").replace("\r", "")
+                trigger_alert(
+                    src_ip, dst_ip, attack_name, "CRITICAL",
+                    f"Signature match found in payload: '{clean_snippet}...'",
+                    config
+                )
+                break
 
 
 def print_dashboard():
@@ -246,7 +257,7 @@ def visualize_attacks():
 
         # Pie chart
         plt.subplot(1, 2, 2)
-        plt.pie(counts, labels=categories, autopct="%1.1f%%", colors=["#ff9999","#66b3ff","#99ff99","#ffcc99"])
+        plt.pie(counts, labels=categories, autopct="%1.1f%%", colors=["#ff9999", "#66b3ff", "#99ff99", "#ffcc99"])
         plt.title("Attack Type Share")
 
         plt.tight_layout()
