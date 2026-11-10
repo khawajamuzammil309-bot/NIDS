@@ -272,7 +272,7 @@ def visualize_attacks():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CodeAlpha Task 4: Network Intrusion Detection System (NIDS)")
+   
     parser.add_argument("-i", "--interface", type=str, default=None, help="Network interface to sniff (e.g. eth0, wlan0).")
     parser.add_argument("-t", "--threshold", type=float, default=1.0, help="Sensitivity multiplier (default 1.0; lower = more sensitive).")
     parser.add_argument("-l", "--log", type=str, default="nids_alerts.log", help="Output text log file path (default: nids_alerts.log).")
